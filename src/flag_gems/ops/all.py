@@ -79,6 +79,37 @@ def all_kernel_2(mid, out, MID_SIZE, BLOCK_MID: tl.constexpr):
     all_val = tl.reduce(mid_val, axis=0, combine_fn=reduce_all)
     tl.store(out, all_val)
 
+@triton.autotune(configs = [triton.Config(kwargs={'BLOCK_N': 2 ** n, 'BLOCK_K': 2 ** k}) for n in range(1, 8) for k in range(5,9)], key = ['M', 'N', 'K'])
+@triton.jit
+def all_kernel_01(inp, outp, M, N, K, S: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    m0 = tl.program_id(0)
+    k = tl.program_id(2) * BLOCK_K + tl.arange(0, BLOCK_K)
+    inp = inp + m0 * N * K + k
+    mask_k = k < K
+    res = tl.full([BLOCK_N, BLOCK_K], value=1, dtype=tl.int1)
+    BN = tl.cdiv(N, S)
+    n0 = tl.program_id(1) * BN
+    for n1 in range(n0, n0 + BN, BLOCK_N):
+        n = n1 + tl.arange(0, BLOCK_N)
+        ptr = inp[None, :] + (n * K)[:, None]
+        mask = mask_k[None, :] and (n < N)[:, None]
+        tile = tl.load(ptr, mask, other=1.0, cache_modifier=".cv", eviction_policy="evict_first")
+        res = res and (tile != 0)
+    res = tl.reduce(res, axis=0, combine_fn=reduce_all)
+    mk = m0 * K + k
+    mask_mk = mk < M * K
+    tl.store(outp + mk * S + tl.program_id(1), res, mask_mk, cache_modifier=".cg")
+
+@triton.autotune(configs = [triton.Config(kwargs={'BLOCK_M': 2 ** m}) for m in range(5, 9)], key = ['M', 'S'])
+@triton.jit
+def all_kernel_02(inp, outp, M, S: tl.constexpr, BLOCK_M: tl.constexpr):
+    m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m < M
+    inp = inp + (m * S)[:, None] + tl.arange(0, S)[None, :]
+    res = tl.load(inp, m_mask[:, None], cache_modifier=".cv", eviction_policy="evict_first")
+    res = tl.reduce(res != 0, axis=1, combine_fn=reduce_all)
+    tl.store(outp + m, res, m_mask, cache_modifier=".wt")
+
 
 def all(inp):
     logging.debug("GEMS ALL")
@@ -96,27 +127,42 @@ def all(inp):
 
     return out
 
+NUM_SMS = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
 
 def all_dim(inp, dim=None, keepdim=False):
     logging.debug("GEMS ALL DIM")
-    shape = list(inp.shape)
     if dim is None:
         out = all(inp)
         if keepdim:
             out = torch.reshape(out, [1] * inp.ndim)
     else:
         assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
+        shape = list(inp.shape)
         dim = dim % inp.ndim
-        inp = dim_compress(inp, dim)
+        M = math.prod(shape[:dim])
         N = shape[dim]
-        shape[dim] = 1
-        M = inp.numel() // N
+        K = inp.numel() // (M * N)
 
+        inp = inp.contiguous()
+
+        shape[dim] = 1
         out = torch.empty(shape, dtype=torch.bool, device=inp.device)
 
-        grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
-        with torch_device_fn.device(inp.device):
-            all_kernel_dim[grid](inp, out, M, N)
+        if K == 1:
+            grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
+            with torch_device_fn.device(inp.device):
+                all_kernel_dim[grid](inp, out, M, N)
+        else:
+            if M < NUM_SMS:
+                S = triton.next_power_of_2(triton.cdiv(NUM_SMS, M))
+                buffer_shape = [M, K, S]
+                out_buffer = torch.empty(buffer_shape, dtype=torch.bool, device=inp.device)
+                all_kernel_01[lambda meta: (M, S, triton.cdiv(K, meta["BLOCK_K"]))](inp, out_buffer, M, N, K, S=S)
+                #print('out_buffer', out_buffer)
+                all_kernel_02[lambda meta: (triton.cdiv(M * K, meta["BLOCK_M"]), )](out_buffer, out, M * K, S=S)
+            else:
+                all_kernel_01[lambda meta: (M, 1, triton.cdiv(K, meta["BLOCK_K"]))](inp, out, M, N, K, S=1)
         if not keepdim:
             out = out.squeeze(dim=dim)
     return out
